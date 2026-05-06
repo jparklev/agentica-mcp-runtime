@@ -1,0 +1,42 @@
+[project]
+name = "agentica-mcp-runtime"
+version = "0.1.0"
+description = "Host-agnostic MCP sandbox runtime — execute MCP tools as Python functions in a sandboxed REPL"
+license = "MIT"
+requires-python = ">=3.12,<3.14"
+authors = [
+    { name = "Symbolica AI Inc.", email = "hello@symbolica.ai" },
+]
+keywords = ["mcp", "sandbox", "repl", "agentica", "tools"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "agentica-internal>=0.3.0",
+    "symbolica-agentica>=0.3.0",
+    "fastmcp<=2.12.3",
+    "mcp>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/symbolica-ai/agentica-mcp-runtime"
+Repository = "https://github.com/symbolica-ai/agentica-mcp-runtime"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentica_mcp_runtime"]
