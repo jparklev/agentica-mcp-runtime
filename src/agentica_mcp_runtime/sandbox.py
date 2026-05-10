@@ -32,33 +32,96 @@ _MCP_SLOW_LOG_MAX = 100
 _MCP_SLOW_LOG: list[dict] = []
 
 
-def _hint_for_mcp_error(msg: str, tool_name: str) -> str | None:
-    """Map a known MCP error signature to a one-line agent-actionable hint.
+# Hint dispatch: reads ~/.local/share/agentica-runtime/hints.md (mtime-cached
+# so agent edits go live without a restart). When the file is missing, falls
+# back to the baked-in list below — small and high-confidence to cover bare-
+# bones installs. The .md format is greppable cards:
+#
+#   ## name
+#   **triggers**:
+#   - substring 1
+#   - substring 2
+#   **hint**: actionable one-liner.
+#
+# All triggers must appear (case-insensitively) in the lowercased error
+# message for a card to match. First match wins.
+import os as _hints_os
+import re as _hints_re
 
-    Growing dictionary of 'I've seen this before, here's what fixes it'.
-    Adding a new entry is one regex + one short hint string.
-    """
+_HINTS_FALLBACK: list[tuple[list[str], str]] = [
+    (["missing a required argument: 'filters'"],
+     "Pass `filters={}` if you don't need filtering — the schema requires the kwarg."),
+    (["stepseconds must be provided", "range"],
+     "Range queries need `stepSeconds` (typically 60). The prom() helper supplies this automatically."),
+    (["code: 47", "db::exception"],
+     "Column doesn't exist. Run `ch_describe(table)` to see the real schema."),
+    (["unknown expression identifier"],
+     "Column doesn't exist. Run `ch_describe(table)` to see the real schema."),
+    (["session not found for thread_id"],
+     "codex thread state doesn't survive runtime restarts. codex_reply only works within the same runtime spawn."),
+    (["401", "anthropic"],
+     "OAuth bearer expired. Call refresh_proxy_token() or restart Claude Code."),
+    (["mcp_unauthorized_no_token"],
+     "MCP server isn't authenticated in the local proxy. Confirm it appears in `claude mcp list` as connected."),
+    (["rate limit"], "Rate-limited or quota exhausted. Back off, or check `await getUsage()` for Dune/Context7."),
+]
+
+_HINTS_PATH = _hints_os.path.expanduser("~/.local/share/agentica-runtime/hints.md")
+_HINTS_CACHE: dict = {"mtime": 0.0, "rules": _HINTS_FALLBACK, "source": "fallback"}
+
+
+def _parse_hints_md(text: str) -> list[tuple[list[str], str]]:
+    """Parse hints.md cards into (triggers, hint) pairs."""
+    rules: list[tuple[list[str], str]] = []
+    for section in _hints_re.split(r"\n## ", text)[1:]:
+        triggers: list[str] = []
+        hint = ""
+        m = _hints_re.search(r"\*\*triggers\*\*:?\s*([^\n]*)((?:\n[ \t]*[-*][^\n]+)*)", section)
+        if m:
+            inline = m.group(1).strip()
+            if inline:
+                triggers.append(inline.strip("`"))
+            for ln in (m.group(2) or "").splitlines():
+                t = ln.strip().lstrip("-*").strip().strip("`")
+                if t:
+                    triggers.append(t)
+        h = _hints_re.search(r"\*\*hint\*\*:?\s*(.+?)(?=\n\n|\n##|\Z)", section, _hints_re.DOTALL)
+        if h:
+            hint = h.group(1).strip()
+        if triggers and hint:
+            rules.append((triggers, hint))
+    return rules
+
+
+def _load_hints() -> list[tuple[list[str], str]]:
+    """Return the active hint list. Reloads from disk on mtime change."""
+    if not _hints_os.path.exists(_HINTS_PATH):
+        if _HINTS_CACHE["source"] != "fallback":
+            _HINTS_CACHE.update(mtime=0.0, rules=_HINTS_FALLBACK, source="fallback")
+        return _HINTS_FALLBACK
+    try:
+        mtime = _hints_os.path.getmtime(_HINTS_PATH)
+    except OSError:
+        return _HINTS_CACHE["rules"]
+    if mtime != _HINTS_CACHE["mtime"]:
+        try:
+            text = open(_HINTS_PATH).read()
+            parsed = _parse_hints_md(text)
+            _HINTS_CACHE.update(mtime=mtime, rules=(parsed or _HINTS_FALLBACK),
+                                source=("hints.md" if parsed else "fallback"))
+        except Exception:
+            pass
+    return _HINTS_CACHE["rules"]
+
+
+def _hint_for_mcp_error(msg: str, tool_name: str) -> str | None:
+    """Map known MCP error signatures to actionable hints. Data lives in
+    ~/.local/share/agentica-runtime/hints.md (agent-editable, hot-reloaded
+    via mtime). Returns None if no rule matches."""
     m = msg.lower()
-    if "missing a required argument: 'filters'" in m or (
-        "invalid arguments" in m and '"filters"' in msg
-    ):
-        return "Pass `filters={}` if you don't need filtering — the schema requires the kwarg."
-    if "stepseconds must be provided" in m and "range" in m:
-        return "Range queries need `stepSeconds` (typically 60). The prom() helper supplies this automatically — use it instead of calling query_prometheus directly."
-    if "unknown expression identifier" in m or ("code: 47" in m and "db::exception" in m):
-        return "Column doesn't exist. Run `ch_describe(table)` to see the real schema, then fix the query."
-    if "session not found for thread_id" in m:
-        return "codex thread state doesn't survive runtime restarts. codex_reply only works within the same runtime spawn — use a fresh codex() call."
-    if ("list_issues" in tool_name or "list_issues" in m) and "invalid_type" in m and '"state"' in msg:
-        return "Linear `state` must be a string (e.g. 'In Progress') or omitted — None is rejected. The linear_my_issues helper handles this."
-    if "input validation error" in m and ("invalid_type" in m or '"expected"' in msg):
-        return f"MCP schema rejected an arg to {tool_name!r}. Check the JSON 'path' in the error for which field is wrong, and confirm the expected type — None is often rejected where a string is required."
-    if "401" in msg and ("anthropic" in m or "mcp-proxy" in m):
-        return "OAuth bearer expired. Call refresh_proxy_token() or restart Claude Code."
-    if "rate limit" in m or "429" in msg or ("quota" in m and "exceeded" in m):
-        return "Rate-limited or quota exhausted. Back off, or check `await getUsage()` if it's Dune/Context7."
-    if "no oauth token is configured" in m or "mcp_unauthorized_no_token" in m:
-        return "This MCP server isn't authenticated in the local proxy. Confirm it appears in `claude mcp list` as connected."
+    for triggers, hint in _load_hints():
+        if all(t.lower() in m for t in triggers):
+            return hint
     return None
 
 
