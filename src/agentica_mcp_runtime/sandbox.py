@@ -72,6 +72,10 @@ _HINTS_CACHE: dict = {"mtime": 0.0, "rules": _HINTS_FALLBACK, "source": "fallbac
 
 def _parse_hints_md(text: str) -> list[tuple[list[str], str]]:
     """Parse hints.md cards into (triggers, hint) pairs."""
+    # Strip fenced code blocks so format examples in docs don't get parsed as
+    # real rules (the doc preamble has a ```…``` example whose `## name`
+    # would otherwise show up alongside the real cards).
+    text = _hints_re.sub(r"```.*?```", "", text, flags=_hints_re.DOTALL)
     rules: list[tuple[list[str], str]] = []
     for section in _hints_re.split(r"\n## ", text)[1:]:
         triggers: list[str] = []
