@@ -76,7 +76,10 @@ def _parse_hints_md(text: str) -> list[tuple[list[str], str]]:
     for section in _hints_re.split(r"\n## ", text)[1:]:
         triggers: list[str] = []
         hint = ""
-        m = _hints_re.search(r"\*\*triggers\*\*:?\s*([^\n]*)((?:\n[ \t]*[-*][^\n]+)*)", section)
+        # `[ \t]*` (not `\s*`) keeps the same-line inline group from spilling
+        # onto the next line; `[-*][ \t]+` requires real list-bullet syntax so
+        # the following `**hint**: …` line doesn't get scooped up as a trigger.
+        m = _hints_re.search(r"\*\*triggers\*\*:?[ \t]*([^\n]*)((?:\n[ \t]*[-*][ \t]+[^\n]+)*)", section)
         if m:
             inline = m.group(1).strip()
             if inline:
