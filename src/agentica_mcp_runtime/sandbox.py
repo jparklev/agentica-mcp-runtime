@@ -594,11 +594,30 @@ EXECUTION_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "agentica_execution_id", default=None
 )
 
-# Hooks fired after each SandboxSession.execute() returns. Each receives
+# Hooks fired BEFORE each SandboxSession.execute() begins running user code.
+# Each receives (execution_id, code, started_at_rfc3339). Canonical use:
+# helpers.py registers a hook that writes a placeholder row to the executions
+# table so a viewer can show "▶ running…" rows in real time.
+_EXECUTION_START_HOOKS: list[Callable[[str, str, str], None]] = []
+
+# Hooks fired AFTER each SandboxSession.execute() returns. Each receives
 # (execution_id, code, ExecutionResult). Canonical use: helpers.py registers
-# a hook that writes one row to artifacts.sqlite's `executions` table, so a
-# separate viewer process can render a timeline of code → output → artifacts.
+# a hook that writes/updates the final row in artifacts.sqlite's `executions`
+# table so a separate viewer process can render a timeline of code → output.
 _EXECUTION_END_HOOKS: list[Callable[[str, str, "ExecutionResult"], None]] = []
+
+
+def register_execution_start_hook(
+    fn: Callable[[str, str, str], None],
+) -> None:
+    """Register a callback to run when a python(code) MCP call STARTS.
+
+    The callback receives `(execution_id, code, started_at)` where
+    `started_at` is an RFC3339 UTC timestamp string. Hooks must NOT raise —
+    failures are logged to stderr and swallowed. Use case: writing a
+    placeholder execution row so the viewer can render in-flight runs.
+    """
+    _EXECUTION_START_HOOKS.append(fn)
 
 
 def register_execution_end_hook(
@@ -895,6 +914,25 @@ class SandboxSession:
         self._has_executed = True
 
         execution_id = uuid.uuid4().hex
+        import datetime as _dt_local
+        started_at = _dt_local.datetime.now(_dt_local.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+        # Fire start hooks. Failures swallowed — observability is non-load-bearing.
+        for hook in _EXECUTION_START_HOOKS:
+            try:
+                hook(execution_id, code, started_at)
+            except Exception as _hook_err:
+                import sys as _sys_local
+                print(
+                    f"[agentica-mcp-runtime] execution_start hook "
+                    f"{getattr(hook, '__name__', repr(hook))} failed: "
+                    f"{type(_hook_err).__name__}: {_hook_err}",
+                    file=_sys_local.stderr,
+                    flush=True,
+                )
+
         token = EXECUTION_ID.set(execution_id)
         try:
             info = await self._repl.async_run_code_info(code)
