@@ -35,6 +35,18 @@ async def lifespan(server: FastMCP):
     tool = Tool.from_function(fn=_execute_impl, name="python", description=description)
     server.add_tool(tool)
 
+    # Concurrent-safe twin of `python`. Spawns a fresh subprocess per call so
+    # multiple sub-agents fanning out don't queue on the persistent REPL.
+    # See `isolated_runner.py` for the bootstrap details. The description here
+    # is intentionally short — sub-agents brief themselves on it, so we want
+    # to keep the tool surface minimal.
+    isolated_tool = Tool.from_function(
+        fn=_execute_isolated_impl,
+        name="python_isolated",
+        description=_ISOLATED_DESCRIPTION,
+    )
+    server.add_tool(isolated_tool)
+
     yield {}
 
     _session.stop()
@@ -200,6 +212,112 @@ async def _execute_impl(code: str = "", code_file: str = "") -> str:
         truncated += f"\n\n... truncated ({remaining} chars). Store data in variables and print only what you need."
         return truncated
 
+    return output
+
+
+# ---------------------------------------------------------------------------
+# `python_isolated`: concurrent-safe twin of `python`.
+#
+# Spawns a fresh subprocess per call. No shared REPL state across calls — use
+# artifact_save / artifact_get to bridge data. ~3-5s cold startup per call;
+# trades that for true concurrency under multi-caller fanout.
+# ---------------------------------------------------------------------------
+_ISOLATED_TIMEOUT_SEC = 180
+
+_ISOLATED_DESCRIPTION = (
+    "Concurrent-safe Python execution in a fresh subprocess per call.\n\n"
+    "Use this from Claude Code sub-agents that share the parent's MCP "
+    "runtime — the stateful `python` tool serializes everything through "
+    "one REPL, so N concurrent sub-agent calls queue and may time out as "
+    "`-32000 Connection closed`. This tool side-steps that by spawning "
+    "an isolated subprocess for each invocation; N concurrent calls fan "
+    "out across N subprocesses.\n\n"
+    "Trade-offs:\n"
+    "  - ~3-5s startup per call (cold MCP Client opens).\n"
+    "  - NO persistent variable state across calls. Use `artifact_save` "
+    "and `artifact_get` (SQLite-backed, multi-writer safe) to share state.\n"
+    "  - `subagent_namespace()` + `subagent_corpus()` are the recommended "
+    "convention: write `artifact_save(f\"{ns}/<topic>\", obj)` from each "
+    "sub-agent, and the parent reads them all back via `subagent_corpus(ns)`.\n\n"
+    "Helpers (helpers.py + presets.md) and all wrapped MCP tools are loaded "
+    "fresh on each call — same surface as `python`, just no persistence."
+)
+
+
+async def _execute_isolated_impl(code: str = "", code_file: str = "") -> str:
+    """Spawn an isolated subprocess to execute `code` (or read it from
+    `code_file`). Returns combined stdout/stderr, capped at MAX_OUTPUT_CHARS.
+
+    See module-level `_ISOLATED_DESCRIPTION` for the design rationale.
+    """
+    if code and code_file:
+        return "ERROR: pass either `code` (inline) or `code_file` (path), not both."
+    if not code and not code_file:
+        return "ERROR: pass either `code` (inline) or `code_file` (path)."
+
+    cleanup_path: str | None = None
+    if code and not code_file:
+        # Materialize inline code to a temp file so the subprocess has a
+        # consistent path-based contract with isolated_runner.
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", prefix="agentica-isolated-", delete=False,
+        ) as tf:
+            tf.write(code)
+            code_file = tf.name
+            cleanup_path = code_file
+
+    import asyncio as _asyncio_local
+    import time as _time_local
+
+    t0 = _time_local.monotonic()
+    try:
+        proc = await _asyncio_local.create_subprocess_exec(
+            sys.executable, "-m", "agentica_mcp_runtime.isolated_runner", code_file,
+            stdout=_asyncio_local.subprocess.PIPE,
+            stderr=_asyncio_local.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await _asyncio_local.wait_for(
+                proc.communicate(), timeout=_ISOLATED_TIMEOUT_SEC,
+            )
+        except _asyncio_local.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return (
+                f"ERROR: python_isolated timed out after {_ISOLATED_TIMEOUT_SEC}s. "
+                "Long-running work belongs in the persistent `python` tool."
+            )
+    finally:
+        # Defensive cleanup. The subprocess's isolated_runner auto-deletes
+        # /tmp ephemerals on read; this handles the case where the subprocess
+        # crashed before reading the file.
+        if cleanup_path:
+            import os as _os_local
+            try:
+                _os_local.unlink(cleanup_path)
+            except OSError:
+                pass
+
+    elapsed = _time_local.monotonic() - t0
+    out = stdout.decode("utf-8", errors="replace")
+    err = stderr.decode("utf-8", errors="replace")
+
+    parts: list[str] = []
+    if out.strip():
+        parts.append(out.rstrip())
+    if err.strip():
+        parts.append(f"[STDERR]\n{err.rstrip()}")
+    if proc.returncode != 0:
+        parts.append(f"[exit code: {proc.returncode}]")
+    parts.append(f"[isolated; {elapsed:.2f}s]")
+
+    output = "\n".join(parts) if parts else "(no output)"
+    if len(output) > MAX_OUTPUT_CHARS:
+        truncated = output[:MAX_OUTPUT_CHARS]
+        remaining = len(output) - MAX_OUTPUT_CHARS
+        truncated += f"\n\n... truncated ({remaining} chars)."
+        return truncated
     return output
 
 
