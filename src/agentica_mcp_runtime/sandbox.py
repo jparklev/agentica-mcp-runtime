@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import functools
 import json
 import time
@@ -20,8 +19,13 @@ from fastmcp.client import Client
 # Without this, every wrapped tool call spawns a fresh stdio subprocess (or a
 # fresh HTTP session), which breaks any server that holds in-memory state
 # across calls — most notably codex's conversation threads.
+#
+# Each client's async context lifecycle is managed directly (not via a shared
+# AsyncExitStack) so `_evict_persistent_client` can tear down ONE client
+# mid-life without disturbing the others. The shutdown path
+# (`close_persistent_clients`) iterates the cache and closes everything that
+# survived.
 _persistent_clients: dict[int, Client] = {}
-_client_stack: contextlib.AsyncExitStack | None = None
 _open_lock: asyncio.Lock | None = None
 
 # Slow-tool capture: every MCP call whose wall time exceeds the threshold
@@ -157,7 +161,7 @@ def _maybe_parse_json(text):
 
 async def _get_persistent_client(mcp_config) -> Client:
     """Return an open Client for this mcp_config, opening one if needed."""
-    global _client_stack, _open_lock
+    global _open_lock
     cid = id(mcp_config)
     cached = _persistent_clients.get(cid)
     if cached is not None:
@@ -168,24 +172,46 @@ async def _get_persistent_client(mcp_config) -> Client:
         cached = _persistent_clients.get(cid)
         if cached is not None:
             return cached
-        if _client_stack is None:
-            _client_stack = contextlib.AsyncExitStack()
-            await _client_stack.__aenter__()
         client = Client(mcp_config)
-        await _client_stack.enter_async_context(client)
+        await client.__aenter__()
         _persistent_clients[cid] = client
         return client
 
 
+async def _evict_persistent_client(mcp_config) -> None:
+    """Drop the cached Client for `mcp_config`.
+
+    Called from `_wrap_mcp_function` whenever a tool call fails — either by
+    raising at the transport layer or by returning `isError=True` from the
+    server. The next call rebuilds the Client, which:
+
+      * re-runs the auth resolution flow (so a freshly-rotated keychain bearer
+        is picked up automatically — no agent-visible `refresh_proxy_token()`
+        verb needed), and
+      * starts a fresh stdio subprocess / HTTP session if the previous one
+        was wedged.
+
+    Best-effort close: failures during teardown are swallowed because the
+    eviction itself must always succeed — leaving a stale Client cached
+    would defeat the point.
+    """
+    cid = id(mcp_config)
+    client = _persistent_clients.pop(cid, None)
+    if client is None:
+        return
+    try:
+        await client.__aexit__(None, None, None)
+    except Exception:
+        pass
+
+
 async def close_persistent_clients() -> None:
     """Close all open persistent clients. Called from the server lifespan teardown."""
-    global _client_stack
-    stack = _client_stack
-    _client_stack = None
+    clients = list(_persistent_clients.values())
     _persistent_clients.clear()
-    if stack is not None:
+    for client in clients:
         try:
-            await stack.__aexit__(None, None, None)
+            await client.__aexit__(None, None, None)
         except Exception:
             pass
 
@@ -376,9 +402,20 @@ def _wrap_mcp_function(fn: MCPFunction) -> Callable:
             raise TypeError(f"{base}\n\nHINT: {hint}" if hint else base) from None
         args_dict: dict = {py_to_mcp.get(k, k): v for k, v in bound.arguments.items()}
 
-        client = await _get_persistent_client(fn._MCPFunction__mcp_config)
+        mcp_config = fn._MCPFunction__mcp_config
+        client = await _get_persistent_client(mcp_config)
         _t0 = time.time()
-        result = await client.session.call_tool(fn.__name__, args_dict)
+        # Evict-on-failure: any error from this tool call (transport raise OR
+        # server-reported isError) drops the cached Client so the next call
+        # re-opens fresh. That's how we let a rotated keychain bearer take
+        # effect without the agent ever calling a refresh verb — the auth
+        # resolution path runs at Client open time, so a new Client picks up
+        # whatever's currently in the keychain.
+        try:
+            result = await client.session.call_tool(fn.__name__, args_dict)
+        except Exception:
+            await _evict_persistent_client(mcp_config)
+            raise
         _elapsed = time.time() - _t0
         # Slow-tool capture: ring buffer of calls over the threshold so
         # slow_tool_log() / runtime_status() can surface bogged-down tools.
@@ -393,6 +430,7 @@ def _wrap_mcp_function(fn: MCPFunction) -> Callable:
                 _MCP_SLOW_LOG.pop(0)
         if result.isError:
             msg = ";".join(getattr(tc, "text", repr(tc)) for tc in result.content)
+            await _evict_persistent_client(mcp_config)
             hint = _hint_for_mcp_error(msg, fn.__name__)
             raise RuntimeError(f"{msg}\n\nHINT: {hint}" if hint else msg)
 
