@@ -160,7 +160,21 @@ async def _main_async(code_file: str) -> int:
             os.unlink(code_file)
 
     globals_dict = await _bootstrap_globals()
-    return await _exec_user_code(user_code, globals_dict)
+    try:
+        return await _exec_user_code(user_code, globals_dict)
+    finally:
+        # Close MCP Client sessions cleanly before the subprocess exits.
+        # Without this, every python_isolated call leaks N abandoned
+        # sessions on the cloud MCP backends until their own idle
+        # timeouts expire — slow accumulation but real.
+        try:
+            from agentica_mcp_runtime.sandbox import close_persistent_clients
+            await close_persistent_clients()
+        except Exception as e:
+            # Swallow: we're on the exit path, the user already got
+            # their result, no point crashing the subprocess for cleanup.
+            print(f"[isolated_runner] close_persistent_clients failed: {e}",
+                  file=sys.stderr)
 
 
 def main():
