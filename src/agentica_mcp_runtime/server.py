@@ -195,6 +195,26 @@ async def _execute_impl(code: str = "", code_file: str = "") -> str:
 
     if result.error:
         parts.append(f"ERROR ({result.exception_name}): {result.error}")
+        # Two layers of actionable hint, in order of specificity:
+        #   1. Shadow detector — if user code has rebound a helper to a
+        #      non-callable, name it specifically and tell them how to
+        #      restore. Catches the `'int' object is not callable` family
+        #      of errors that prose docs alone never seem to prevent.
+        shadowed = _session.currently_shadowed_helpers()
+        if shadowed:
+            parts.append(
+                f"\nHINT: helper(s) shadowed in REPL globals: {shadowed}. "
+                f"Call `helpers_reload()` to restore from disk, or rename "
+                f"the variable in your code."
+            )
+        #   2. hints.md dispatch — same dispatcher we use for MCP errors,
+        #      now applied to the Python traceback. Lets hints.md cards
+        #      grow to cover REPL-side error patterns too, not just
+        #      transport-side MCP failures.
+        from agentica_mcp_runtime.sandbox import _hint_for_mcp_error
+        py_hint = _hint_for_mcp_error(result.error or "", result.exception_name or "")
+        if py_hint:
+            parts.append(f"\nHINT: {py_hint}")
 
     if result.added_vars:
         parts.append(f"New variables: {', '.join(result.added_vars)}")

@@ -116,6 +116,102 @@ _RECENT_EVICTIONS_MAX = 20
 _INSTALLED_DIAGNOSTICS = False
 
 
+# ---------------------------------------------------------------------------
+# Pre-exec shadow lint + post-error shadow detection.
+#
+# Problem: the REPL's globals dict is shared across all python() calls AND
+# auto-loaded with ~150 helpers (cap, peek, ch, slack_search, ...). User code
+# like `cap = 1` accidentally rebinds a helper to a non-callable; subsequent
+# `cap(obj)` calls fail with `'int' object is not callable`. Prose docs warn
+# about this; agents (including this one!) still hit it.
+#
+# Two structural defenses, both implemented here:
+#   1. Pre-exec AST scan walks the user's code for `Assign` / `AnnAssign` /
+#      `For` / `Import` / walrus targets at module scope (i.e. not inside
+#      def/class/lambda/comprehension bodies). If any target name is in the
+#      session's `_original_helper_names` snapshot, emit a `[lint] WARNING`
+#      banner prepended to the call's output. Doesn't block — agents may
+#      legitimately want to shadow — but the warning lands at the moment of
+#      pain.
+#   2. Post-error scan: `_currently_shadowed_helpers` walks the live globals
+#      and returns helper names whose value is no longer callable. The
+#      server layer appends this to the error message as an actionable
+#      HINT, replacing prose-doc archeology with point-of-pain telemetry.
+# ---------------------------------------------------------------------------
+import ast as _ast
+
+
+def _scan_module_scope_assigns(code: str) -> set[str]:
+    """Names assigned at the user code's module scope.
+
+    Walks the AST but explicitly does NOT descend into `FunctionDef`,
+    `AsyncFunctionDef`, `ClassDef`, `Lambda`, or comprehension scopes —
+    those introduce their own local scope and don't rebind module globals.
+    Covers `Assign`, `AnnAssign`, `AugAssign`, `For`/`AsyncFor`, walrus
+    (`NamedExpr`), and `Import`/`ImportFrom` (which also bind names).
+
+    Returns an empty set on `SyntaxError` so a bad user-code parse never
+    blocks the actual execution path — the REPL will report the SyntaxError
+    on its own with full context.
+    """
+    try:
+        tree = _ast.parse(code)
+    except SyntaxError:
+        return set()
+
+    SKIP = (
+        _ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef, _ast.Lambda,
+        _ast.ListComp, _ast.SetComp, _ast.DictComp, _ast.GeneratorExp,
+    )
+
+    names: set[str] = set()
+
+    def _collect_target(target) -> None:
+        if isinstance(target, _ast.Name):
+            names.add(target.id)
+        elif isinstance(target, (_ast.Tuple, _ast.List)):
+            for elt in target.elts:
+                _collect_target(elt)
+        elif isinstance(target, _ast.Starred):
+            _collect_target(target.value)
+
+    def _visit(node) -> None:
+        if isinstance(node, _ast.Assign):
+            for t in node.targets:
+                _collect_target(t)
+        elif isinstance(node, (_ast.AnnAssign, _ast.AugAssign)):
+            _collect_target(node.target)
+        elif isinstance(node, (_ast.For, _ast.AsyncFor)):
+            _collect_target(node.target)
+        elif isinstance(node, _ast.NamedExpr):
+            _collect_target(node.target)
+        elif isinstance(node, _ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, _ast.ImportFrom):
+            for alias in node.names:
+                names.add(alias.asname or alias.name)
+        elif isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+            # A def/class statement binds its NAME at the enclosing scope.
+            # That's a real shadow if the name overlaps with a helper.
+            names.add(node.name)
+        # Stop here — don't descend into a new scope.
+        if isinstance(node, SKIP):
+            return
+        for child in _ast.iter_child_nodes(node):
+            _visit(child)
+
+    _visit(tree)
+    return names
+
+
+def _lint_for_helper_shadow(code: str, protected: set[str]) -> list[str]:
+    """Return the sorted list of protected names this code would shadow."""
+    if not protected:
+        return []
+    return sorted(_scan_module_scope_assigns(code) & protected)
+
+
 def _record_eviction(server: str, error_class: str, msg: str) -> None:
     """Ring-buffer an eviction event and emit a stderr breadcrumb.
 
@@ -576,6 +672,12 @@ class SandboxSession:
         self._repl: BaseRepl | None = None
         self._tools: dict[str, MCPFunction] = {}
         self._has_executed: bool = False
+        # Populated at the end of `start()`. Used by `currently_shadowed_helpers()`
+        # and the pre-exec lint to detect when user code accidentally rebinds
+        # an auto-loaded helper. Kept as a reference to the live globals dict
+        # so subsequent shadow-checks see the current state, not a stale copy.
+        self._globals_dict: dict | None = None
+        self._original_helper_names: frozenset[str] = frozenset()
 
     @property
     def is_active(self) -> bool:
@@ -685,6 +787,52 @@ class SandboxSession:
             hidden_vars=(),
         )
 
+        # Snapshot the protected-helper names. Public, callable names that
+        # aren't standard-library shims (asyncio, json) become the
+        # "shadowing this would be bad" set.
+        #
+        # IMPORTANT: BaseRepl.set_vars(GLOBALS, dict) does
+        # `self.vars.globals.update(dict)` — it copies entries into its OWN
+        # globals dict rather than referencing ours. So `globals_dict` here
+        # is now stale w.r.t. what user code actually mutates. Anchor to
+        # `self._repl.vars.globals` instead — that's the live namespace.
+        self._globals_dict = self._repl.vars.globals
+        self._original_helper_names = frozenset(
+            name for name, val in self._globals_dict.items()
+            if not name.startswith("_")
+            and name not in {"asyncio", "json"}
+            and callable(val)
+        )
+
+    def currently_shadowed_helpers(self) -> list[str]:
+        """Helper names whose live REPL value is no longer callable.
+
+        Called by the server layer on error to produce an actionable HINT
+        when the user has accidentally rebound a helper. Returns a sorted
+        list — empty when nothing is shadowed.
+
+        BaseRepl exposes separate `vars.locals` and `vars.globals` dicts;
+        user code at top level can land in either. Python's LEGB lookup
+        consults locals first, so a local shadow wins even if globals is
+        clean. We mirror that here: prefer locals' value, fall back to
+        globals.
+        """
+        if self._repl is None:
+            return []
+        repl_locals = self._repl.vars.locals
+        repl_globals = self._repl.vars.globals
+        out: list[str] = []
+        for name in self._original_helper_names:
+            if name in repl_locals:
+                val = repl_locals[name]
+            elif name in repl_globals:
+                val = repl_globals[name]
+            else:
+                continue  # explicitly deleted — not shadowing
+            if not callable(val):
+                out.append(name)
+        return sorted(out)
+
     async def execute(self, code: str) -> ExecutionResult:
         """Execute Python code in the REPL.
 
@@ -694,6 +842,19 @@ class SandboxSession:
         if self._repl is None:
             raise RuntimeError("Sandbox not initialized — no MCP tools were discovered at startup.")
 
+        # Pre-exec lint: scan the user code's module-scope assignments for
+        # any name that's currently an auto-loaded helper. If found, prepend
+        # a `[lint] WARNING` banner so the agent sees it next to its result.
+        lint_warning = ""
+        shadowed_in_code = _lint_for_helper_shadow(code, set(self._original_helper_names))
+        if shadowed_in_code:
+            lint_warning = (
+                f"[lint] WARNING: this code assigns to helper name(s) {shadowed_in_code} "
+                f"at module scope, which will SHADOW the auto-loaded helper(s). "
+                f"Future calls to {shadowed_in_code[0]}(...) will fail. "
+                f"Rename your local variables, or call `helpers_reload()` to restore.\n"
+            )
+
         self._has_executed = True
         info = await self._repl.async_run_code_info(code)
 
@@ -702,7 +863,7 @@ class SandboxSession:
             error_str = info.traceback_str or info.exception_name or "Unknown error"
 
         return ExecutionResult(
-            output=info.output,
+            output=lint_warning + info.output,
             result_repr=info.out_str,
             error=error_str,
             exception_name=info.exception_name,
