@@ -10,15 +10,28 @@ from agentica_mcp_runtime.sandbox import ExecutionResult
 from agentica_mcp_runtime.server import MAX_OUTPUT_CHARS, _build_execute_description, _execute_impl, create_server
 
 
-def test_description_with_stubs():
-    desc = _build_execute_description("async def foo(): ...")
-    assert "Available tools in the REPL:" in desc
-    assert "async def foo(): ..." in desc
+def test_description_with_tools():
+    # `_build_execute_description` switched from taking pre-rendered
+    # stubs to taking the tools dict and rendering a server catalog
+    # (saves ~95% of tool-description tokens). Verify the catalog
+    # block appears and the server name shows up.
+    from types import SimpleNamespace
+
+    fake_cfg = SimpleNamespace(mcpServers={"slack": object()})
+    fake_fn = SimpleNamespace(
+        __name__="search",
+        _MCPFunction__mcp_config=fake_cfg,
+    )
+    desc = _build_execute_description({"search": fake_fn})
+    assert "WRAPPED MCP SERVERS" in desc
+    assert "slack" in desc
 
 
-def test_description_without_stubs():
-    desc = _build_execute_description("")
-    assert "Available tools in the REPL:" not in desc
+def test_description_without_tools():
+    desc = _build_execute_description({})
+    # Catalog block only renders when tools are present; the static
+    # discovery / disclosure preamble is always there.
+    assert "WRAPPED MCP SERVERS" not in desc
     assert "Stateful Python REPL" in desc
 
 

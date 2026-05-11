@@ -38,5 +38,13 @@ dev = [
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
+# Pin `symbolica-agentica` to our SDK fork for tests + dev. Upstream
+# PyPI 0.3.0 is missing `sanitize_param_name` (added in our SDK fork's
+# unmcp/sigs.py — needed for hyphenated-tool / param handling and used
+# by the runtime's sandbox at import time). When upstream catches up
+# this override can drop.
+[tool.uv.sources]
+symbolica-agentica = { git = "https://github.com/jparklev/agentica-python-sdk", rev = "66f16ed7f3f1b26f5fee9288ccd683f11e5516f2" }
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentica_mcp_runtime"]

@@ -37,6 +37,157 @@ _MCP_SLOW_LOG_MAX = 100
 _MCP_SLOW_LOG: list[dict] = []
 
 
+# Failure classification for retry-decision purposes. Mirrors the
+# `McpInvocationErrorClass` taxonomy from our executor branch
+# (packages/plugins/mcp/src/sdk/errors.ts) so the two stacks share a
+# mental model:
+#
+#   - 'auth':      401/403 from the proxy, "Unauthorized", expired-token
+#                  errors. Eviction + the pre-open keychain hook is the
+#                  self-heal path; retry-on-fresh-Client may succeed.
+#   - 'transport': socket/network failure, 5xx, 408, 429, ECONN*,
+#                  "socket hang up". Same eviction path — a fresh
+#                  Client may recover from a wedged connection.
+#   - 'tool':      server understood the call but rejected it (4xx
+#                  other than 401/403/408/429, bad args, schema
+#                  rejection, application-level "no such record").
+#                  Retry doubles the RPC for zero gain.
+#   - 'unknown':   couldn't classify. Defaults to NO-EVICT so bugs in
+#                  our own code don't burn keychain reads.
+#
+# Only 'transport' and 'auth' classes trigger Client eviction in
+# `_wrap_mcp_function`.
+import re as _err_re
+
+_TRANSIENT_HTTP = {408, 429}
+_AUTH_HTTP = {401, 403}
+
+# Empirical regex sourced from the executor branch's NETWORK_KEYWORD_RE
+# (which itself was hardened against real Node-runtime errors like
+# `socket hang up`). Matches against message text AND any stringified
+# `code` attribute so Python's anyio/httpx layer — which surfaces
+# symbolic codes the same way Node does — participates fully.
+_NETWORK_KEYWORD_RE = _err_re.compile(
+    r"fetch failed|ECONN(REFUSED|RESET|ABORTED)|ETIMEDOUT|EPIPE"
+    r"|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN"
+    r"|socket hang up|connection (refused|reset|aborted|closed)"
+    r"|read time(d|-)? ?out|network is (unreachable|down)",
+    _err_re.IGNORECASE,
+)
+
+# Auth-keyword regex. `\b` boundaries on the bare codes / words avoid
+# false positives like "401k plan" or "user unauthorized to delete X"
+# in app-level content. We accept the rare false positive here as a
+# better trade-off than missing a real auth failure.
+#
+# Both "Token expired" and "expired token" must match — phrasing
+# varies across servers — so the keyword and the trigger word are
+# allowed in either order, with a small distance window.
+_AUTH_KEYWORD_RE = _err_re.compile(
+    r"\bunauthori[sz]ed\b|\b401\b|\b403\b"
+    r"|(invalid|expired).{0,20}(token|bearer|api[- ]?key|session|credential)"
+    r"|(token|bearer|api[- ]?key|session|credential).{0,20}(invalid|expired)"
+    r"|mcp_unauthorized",
+    _err_re.IGNORECASE,
+)
+
+# Tool-keyword regex for the `isError=True` path, where we have only a
+# message string (no exception object → no numeric code). Server-side
+# rejections of the call shape (bad args, schema mismatch, method not
+# found, not-found-of-a-specific-resource) belong here — eviction +
+# keychain re-read on these would just double the RPC.
+#
+# Order matters: this runs AFTER the auth regex, so "Unauthorized:
+# missing api key" still resolves to auth, not tool.
+_TOOL_KEYWORD_RE = _err_re.compile(
+    r"\binvalid (argument|parameter|input|request|field)"
+    r"|\bmissing (required|argument|parameter|field)"
+    r"|schema (validation|error|mismatch|failed)"
+    r"|\bbad request\b"
+    r"|method not (found|allowed)"
+    r"|\bvalidation failed\b"
+    r"|\bnot found\b",
+    _err_re.IGNORECASE,
+)
+
+
+def _extract_http_code(err: Exception) -> int | None:
+    """Pull a numeric HTTP status from an exception. Returns None if absent.
+
+    Checks `.status_code` and `.code`, plus `.response.status_code`
+    (httpx layers the actual response there). Non-int values are ignored
+    so a string `err.code = "ECONNRESET"` doesn't masquerade as HTTP 0.
+    """
+    for attr in ("status_code", "code"):
+        v = getattr(err, attr, None)
+        if isinstance(v, int):
+            return v
+    resp = getattr(err, "response", None)
+    if resp is not None:
+        v = getattr(resp, "status_code", None)
+        if isinstance(v, int):
+            return v
+    return None
+
+
+def _classify_error(err: Exception | None, message: str) -> str:
+    """Classify an MCP call failure. See module-level taxonomy comment.
+
+    Pass `err=None` for the `isError=True` path (server-reported error
+    with only a message string); pass the live exception for the
+    transport-raise path. Both surfaces share this one classifier so
+    eviction decisions are consistent across error shapes.
+    """
+    msg = (message or "").lower()
+
+    # 1. Exception-class name is the most specific signal. httpx names
+    #    things like "ConnectTimeout", "ConnectError", "RemoteProtocolError";
+    #    fastmcp passes through whatever the underlying transport raised.
+    if err is not None:
+        name = type(err).__name__.lower()
+        if "unauthorized" in name or "forbidden" in name:
+            return "auth"
+        if "timeout" in name or "connect" in name or "protocol" in name:
+            return "transport"
+
+    # 2. Auth keyword match before numeric code, because the proxy can
+    #    return 200 OK with isError=True and "Unauthorized" in the body
+    #    — that's a `tool`-shaped envelope carrying auth content.
+    if _AUTH_KEYWORD_RE.search(msg):
+        return "auth"
+
+    # 3. Numeric HTTP status on the exception. Order matches the executor:
+    #    auth → transient transport → server-error transport → generic 4xx tool.
+    if err is not None:
+        code = _extract_http_code(err)
+        if code is not None:
+            if code in _AUTH_HTTP:
+                return "auth"
+            if code in _TRANSIENT_HTTP or code >= 500:
+                return "transport"
+            if code >= 400:
+                return "tool"
+
+    # 4. Network keyword match against message + stringified symbolic code.
+    code_str = ""
+    if err is not None:
+        v = getattr(err, "code", None)
+        if isinstance(v, str):
+            code_str = v
+    if _NETWORK_KEYWORD_RE.search(f"{msg} {code_str.lower()}"):
+        return "transport"
+
+    # 5. Tool-rejection keywords (message-only). Handles the common
+    #    `isError=True` envelope where there's no exception to inspect —
+    #    server understood the call and rejected it. Falls AFTER the
+    #    auth + network keyword checks so an "Unauthorized: invalid api
+    #    key" message still resolves to auth, not tool.
+    if _TOOL_KEYWORD_RE.search(msg):
+        return "tool"
+
+    return "unknown"
+
+
 # Hint dispatch: reads ~/.local/share/agentica-runtime/hints.md (mtime-cached
 # so agent edits go live without a restart). When the file is missing, falls
 # back to the baked-in list below — small and high-confidence to cover bare-
@@ -441,16 +592,17 @@ def _wrap_mcp_function(fn: MCPFunction) -> Callable:
         mcp_config = fn._MCPFunction__mcp_config
         client = await _get_persistent_client(mcp_config)
         _t0 = time.time()
-        # Evict-on-failure: any error from this tool call (transport raise OR
-        # server-reported isError) drops the cached Client so the next call
-        # re-opens fresh. That's how we let a rotated keychain bearer take
-        # effect without the agent ever calling a refresh verb — the auth
-        # resolution path runs at Client open time, so a new Client picks up
-        # whatever's currently in the keychain.
+        # Evict only on `transport` / `auth` classes (see _classify_error).
+        # Tool-level rejections (bad args, schema mismatch) keep the
+        # Client cached — retrying with a fresh Client wouldn't change
+        # the outcome and just doubles the proxy round-trip. Unknown
+        # errors also stay cached for the same reason: cold reconnect
+        # is wasted work on bugs in our own code.
         try:
             result = await client.session.call_tool(fn.__name__, args_dict)
-        except Exception:
-            await _evict_persistent_client(mcp_config)
+        except Exception as _e:
+            if _classify_error(_e, str(_e)) in ("transport", "auth"):
+                await _evict_persistent_client(mcp_config)
             raise
         _elapsed = time.time() - _t0
         # Slow-tool capture: ring buffer of calls over the threshold so
@@ -466,7 +618,8 @@ def _wrap_mcp_function(fn: MCPFunction) -> Callable:
                 _MCP_SLOW_LOG.pop(0)
         if result.isError:
             msg = ";".join(getattr(tc, "text", repr(tc)) for tc in result.content)
-            await _evict_persistent_client(mcp_config)
+            if _classify_error(None, msg) in ("transport", "auth"):
+                await _evict_persistent_client(mcp_config)
             hint = _hint_for_mcp_error(msg, fn.__name__)
             raise RuntimeError(f"{msg}\n\nHINT: {hint}" if hint else msg)
 
