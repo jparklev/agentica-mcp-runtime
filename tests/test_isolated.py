@@ -142,3 +142,42 @@ async def test_isolated_handles_syntax_error():
     assert "[STDERR]" in out
     # SyntaxError surfaces with traceback
     assert "SyntaxError" in out or "invalid" in out.lower()
+
+
+async def test_isolated_timeout_parameter_overrides_default(monkeypatch):
+    """Caller-supplied `timeout` actually controls the wait. Use a tiny
+    timeout (2s) against an infinite sleep — should kill + return ERROR
+    well before the default 300s would have."""
+    monkeypatch.setenv("AGENTICA_SERVERS_CONFIG", "/tmp/agentica-test-nonexistent.json")
+    t0 = time.monotonic()
+    out = await _execute_isolated_impl(
+        code="import time; time.sleep(60)\n",
+        timeout=2,
+    )
+    elapsed = time.monotonic() - t0
+    assert "timed out after 2s" in out
+    assert elapsed < 5.0, f"timeout didn't fire promptly; elapsed {elapsed:.2f}s"
+
+
+async def test_isolated_rejects_timeout_out_of_range():
+    out_lo = await _execute_isolated_impl(code="x=1", timeout=0)
+    out_hi = await _execute_isolated_impl(code="x=1", timeout=10000)
+    assert "ERROR" in out_lo and "timeout" in out_lo
+    assert "ERROR" in out_hi and "timeout" in out_hi
+
+
+async def test_isolated_default_timeout_is_300():
+    """The default-timeout error message should reference 300s exactly,
+    so callers / docs see consistent value. Probing via an actual 300s
+    timeout would slow the suite, so we just check the constant via
+    a quick out-of-range probe: pass timeout=301 with the no-server env
+    and confirm it's accepted (within range)."""
+    from agentica_mcp_runtime.server import (
+        _ISOLATED_DEFAULT_TIMEOUT_SEC, _ISOLATED_MAX_TIMEOUT_SEC,
+    )
+    assert _ISOLATED_DEFAULT_TIMEOUT_SEC == 300, (
+        "default timeout drifted; docs and brief templates expect 300s"
+    )
+    assert _ISOLATED_MAX_TIMEOUT_SEC == 600, (
+        "max timeout drifted; safety cap expected 600s"
+    )

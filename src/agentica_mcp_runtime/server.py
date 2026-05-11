@@ -221,8 +221,15 @@ async def _execute_impl(code: str = "", code_file: str = "") -> str:
 # Spawns a fresh subprocess per call. No shared REPL state across calls — use
 # artifact_save / artifact_get to bridge data. ~3-5s cold startup per call;
 # trades that for true concurrency under multi-caller fanout.
+#
+# Timeout policy: default 300s (5 min) is enough for typical multi-source
+# presets that gather across CH + Loki + Prom + Slack. Hard cap at 600s
+# (10 min) — anything longer should split into multiple calls and bridge
+# via artifact_save. Caller can pass `timeout=N` to override down or up
+# (within the cap).
 # ---------------------------------------------------------------------------
-_ISOLATED_TIMEOUT_SEC = 180
+_ISOLATED_DEFAULT_TIMEOUT_SEC = 300
+_ISOLATED_MAX_TIMEOUT_SEC = 600
 
 _ISOLATED_DESCRIPTION = (
     "Concurrent-safe Python execution in a fresh subprocess per call.\n\n"
@@ -232,6 +239,12 @@ _ISOLATED_DESCRIPTION = (
     "`-32000 Connection closed`. This tool side-steps that by spawning "
     "an isolated subprocess for each invocation; N concurrent calls fan "
     "out across N subprocesses.\n\n"
+    "Args:\n"
+    "  code:       inline Python source (preferred for short snippets).\n"
+    "  code_file:  absolute path to a .py file (preferred for >5 lines).\n"
+    "  timeout:    seconds before the subprocess is killed. Default 300s, "
+    "max 600s. Bump to 600 for long Loki/Prom scans; agents should "
+    "asyncio.gather across MCP servers to stay well under.\n\n"
     "Trade-offs:\n"
     "  - ~3-5s startup per call (cold MCP Client opens).\n"
     "  - NO persistent variable state across calls. Use `artifact_save` "
@@ -244,7 +257,11 @@ _ISOLATED_DESCRIPTION = (
 )
 
 
-async def _execute_isolated_impl(code: str = "", code_file: str = "") -> str:
+async def _execute_isolated_impl(
+    code: str = "",
+    code_file: str = "",
+    timeout: int = _ISOLATED_DEFAULT_TIMEOUT_SEC,
+) -> str:
     """Spawn an isolated subprocess to execute `code` (or read it from
     `code_file`). Returns combined stdout/stderr, capped at MAX_OUTPUT_CHARS.
 
@@ -254,6 +271,12 @@ async def _execute_isolated_impl(code: str = "", code_file: str = "") -> str:
         return "ERROR: pass either `code` (inline) or `code_file` (path), not both."
     if not code and not code_file:
         return "ERROR: pass either `code` (inline) or `code_file` (path)."
+    if timeout < 1 or timeout > _ISOLATED_MAX_TIMEOUT_SEC:
+        return (
+            f"ERROR: timeout must be in [1, {_ISOLATED_MAX_TIMEOUT_SEC}] seconds; "
+            f"got {timeout}. Anything longer should be split across multiple "
+            f"calls bridged via artifact_save."
+        )
 
     cleanup_path: str | None = None
     if code and not code_file:
@@ -279,14 +302,15 @@ async def _execute_isolated_impl(code: str = "", code_file: str = "") -> str:
         )
         try:
             stdout, stderr = await _asyncio_local.wait_for(
-                proc.communicate(), timeout=_ISOLATED_TIMEOUT_SEC,
+                proc.communicate(), timeout=timeout,
             )
         except _asyncio_local.TimeoutError:
             proc.kill()
             await proc.wait()
             return (
-                f"ERROR: python_isolated timed out after {_ISOLATED_TIMEOUT_SEC}s. "
-                "Long-running work belongs in the persistent `python` tool."
+                f"ERROR: python_isolated timed out after {timeout}s. "
+                "Pass `timeout=N` (max 600) to extend, or split across "
+                "multiple calls bridged via artifact_save."
             )
     finally:
         # Defensive cleanup. The subprocess's isolated_runner auto-deletes
