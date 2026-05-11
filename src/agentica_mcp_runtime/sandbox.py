@@ -8,6 +8,7 @@ import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from agentica.unmcp import MCPFunction
 from agentica.unmcp.sigs import sanitize_param_name
@@ -63,8 +64,6 @@ _HINTS_FALLBACK: list[tuple[list[str], str]] = [
      "Column doesn't exist. Run `ch_describe(table)` to see the real schema."),
     (["session not found for thread_id"],
      "codex thread state doesn't survive runtime restarts. codex_reply only works within the same runtime spawn."),
-    (["401", "anthropic"],
-     "OAuth bearer expired. Call refresh_proxy_token() or restart Claude Code."),
     (["mcp_unauthorized_no_token"],
      "MCP server isn't authenticated in the local proxy. Confirm it appears in `claude mcp list` as connected."),
     (["rate limit"], "Rate-limited or quota exhausted. Back off, or check `await getUsage()` for Dune/Context7."),
@@ -159,6 +158,31 @@ def _maybe_parse_json(text):
     return text
 
 
+# Pre-open hooks: app-level callbacks invoked once before each cold Client
+# open. Each receives the mcp_config and may mutate it in place. The
+# canonical use is re-reading a rotated OAuth bearer from a system keychain
+# (kept out of this module so the fork stays generic). Failures in a hook
+# are swallowed + recorded so a broken hook can't deadlock the pool — a
+# stale-bearer cold open will surface as a 401 on the next call, which
+# triggers eviction, which re-fires the hook with the fixed callback.
+_PRE_OPEN_HOOKS: list[Callable[[Any], None]] = []
+
+
+def register_pre_open_hook(fn: Callable[[Any], None]) -> None:
+    """Register a callback to run before each cold MCP `Client` open.
+
+    The callback receives the `mcp_config` and may mutate it in place
+    (typically to refresh a rotated auth header). Use case in our
+    deployment: helpers.py registers a hook that re-reads the Claude
+    Code OAuth bearer from the macOS keychain and patches the
+    Authorization header on cloud-MCP entries. With this in place the
+    "any tool error → evict cached Client → next call cold-opens" flow
+    transparently picks up rotated tokens — replacing what used to be
+    an agent-visible `refresh_proxy_token()` verb.
+    """
+    _PRE_OPEN_HOOKS.append(fn)
+
+
 async def _get_persistent_client(mcp_config) -> Client:
     """Return an open Client for this mcp_config, opening one if needed."""
     global _open_lock
@@ -172,6 +196,19 @@ async def _get_persistent_client(mcp_config) -> Client:
         cached = _persistent_clients.get(cid)
         if cached is not None:
             return cached
+        # Fire pre-open hooks BEFORE constructing the Client — they may
+        # mutate `mcp_config.mcpServers[*].headers` (rotated bearer etc.)
+        # which fastmcp reads at Client construction time.
+        for _hook in _PRE_OPEN_HOOKS:
+            try:
+                _hook(mcp_config)
+            except Exception as e:
+                import sys as _sys
+                print(
+                    f"[agentica-mcp-runtime] pre-open hook {_hook.__name__} failed: "
+                    f"{type(e).__name__}: {e}",
+                    file=_sys.stderr,
+                )
         client = Client(mcp_config)
         await client.__aenter__()
         _persistent_clients[cid] = client
@@ -185,9 +222,8 @@ async def _evict_persistent_client(mcp_config) -> None:
     raising at the transport layer or by returning `isError=True` from the
     server. The next call rebuilds the Client, which:
 
-      * re-runs the auth resolution flow (so a freshly-rotated keychain bearer
-        is picked up automatically — no agent-visible `refresh_proxy_token()`
-        verb needed), and
+      * re-runs every registered pre-open hook (so a rotated keychain bearer
+        gets patched into the headers — no agent-visible refresh verb), and
       * starts a fresh stdio subprocess / HTTP session if the previous one
         was wedged.
 

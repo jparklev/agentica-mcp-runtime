@@ -83,7 +83,7 @@ def _build_execute_description(tools) -> str:
         "  find_preset()  / find_preset('rfq')  — preset catalog / by intent",
         "  Domain helpers (full list via the above): prom, loki, ch, slack_search,",
         "  notion_top, linear_my_issues, dune_search, pd_oncall, codex_each, ask_gemini,",
-        "  judge (cross-model), slack_hit_thread, grafana_*_url, refresh_proxy_token.",
+        "  judge (cross-model), slack_hit_thread, grafana_*_url.",
         "",
         "DISCLOSURE & STATE (the load-bearing primitives):",
         "  cap(obj, max_chars=...)              — wraps big returns w/ structural summary + result_id",
