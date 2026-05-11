@@ -36,6 +36,159 @@ _MCP_SLOW_THRESHOLD_SEC = 10.0
 _MCP_SLOW_LOG_MAX = 100
 _MCP_SLOW_LOG: list[dict] = []
 
+# ---------------------------------------------------------------------------
+# Per-server concurrency cap on outbound MCP calls.
+#
+# A real incident: a parallel `asyncio.gather` of ~40 `slack_search` calls
+# overwhelmed Slack's MCP server through the proxy. The downstream transport
+# closed, fastmcp's session tore down, and the runtime process exited —
+# leaving Claude Code holding a dead stdio pipe with no way to recover.
+#
+# The fix is structural: cap concurrent in-flight calls *per server*. Slack
+# can have up to N in flight at once; Notion gets its own quota; they don't
+# compete. Anything above the cap queues — a 40-query batch becomes 5 rounds
+# of 8 instead of one stampede.
+#
+# Default cap (8) is per-asyncio-loop-per-server. Tune with
+# `set_server_concurrency("slack", 4)` for stricter or `..., 16)` for laxer.
+# ---------------------------------------------------------------------------
+_DEFAULT_SERVER_CONCURRENCY = 8
+_SERVER_SEMAPHORES: dict[str, asyncio.Semaphore] = {}
+_SERVER_CAP_OVERRIDES: dict[str, int] = {}
+_SEMAPHORE_INIT_LOCK: asyncio.Lock | None = None
+
+
+def set_server_concurrency(server: str, cap: int) -> None:
+    """Override the per-server concurrency cap. Idempotent.
+
+    Applies to subsequently-created semaphores. If a semaphore for `server`
+    already exists in this loop, replaces it (in-flight callers retain their
+    old semaphore via reference; new callers see the new cap).
+    """
+    if cap < 1:
+        raise ValueError(f"cap must be >= 1, got {cap}")
+    _SERVER_CAP_OVERRIDES[server] = cap
+    if server in _SERVER_SEMAPHORES:
+        del _SERVER_SEMAPHORES[server]
+
+
+def _server_name_for_config(mcp_config) -> str:
+    """Resolve the single server name from an MCPConfig. The MCPConfig wrapper
+    we get from agentica.unmcp is one-server-per-config, so the only key in
+    `mcpServers` is the answer."""
+    srv_map = getattr(mcp_config, "mcpServers", None)
+    if srv_map:
+        return next(iter(srv_map.keys()))
+    return "?"
+
+
+async def _get_server_semaphore(server_name: str) -> asyncio.Semaphore:
+    global _SEMAPHORE_INIT_LOCK
+    sem = _SERVER_SEMAPHORES.get(server_name)
+    if sem is not None:
+        return sem
+    if _SEMAPHORE_INIT_LOCK is None:
+        _SEMAPHORE_INIT_LOCK = asyncio.Lock()
+    async with _SEMAPHORE_INIT_LOCK:
+        sem = _SERVER_SEMAPHORES.get(server_name)
+        if sem is not None:
+            return sem
+        cap = _SERVER_CAP_OVERRIDES.get(server_name, _DEFAULT_SERVER_CONCURRENCY)
+        sem = asyncio.Semaphore(cap)
+        _SERVER_SEMAPHORES[server_name] = sem
+        return sem
+
+
+# ---------------------------------------------------------------------------
+# Crash / exit diagnostics. The runtime previously died silently under load —
+# the proxy closed transports, fastmcp tore down its session, Python exited
+# with no traceback in Claude Code's MCP log. We capture three signals so the
+# next failure leaves a breadcrumb:
+#
+#   1. Every transport/auth eviction prints a one-liner to stderr with the
+#      classified error and the server. A cascade is now visible.
+#   2. An `atexit` hook logs process exit + the last 5 evictions.
+#   3. The asyncio loop's exception handler logs uncaught task failures —
+#      fastmcp can swallow these otherwise.
+# ---------------------------------------------------------------------------
+_RECENT_EVICTIONS: list[dict] = []
+_RECENT_EVICTIONS_MAX = 20
+_INSTALLED_DIAGNOSTICS = False
+
+
+def _record_eviction(server: str, error_class: str, msg: str) -> None:
+    """Ring-buffer an eviction event and emit a stderr breadcrumb.
+
+    `_RECENT_EVICTIONS` is what the atexit handler dumps so an exit-during-
+    cascade scenario shows "the 8 evictions before death" instead of just
+    "the process exited."
+    """
+    import sys as _sys, time as _time
+    entry = {
+        "ts": _time.time(),
+        "server": server,
+        "class": error_class,
+        "msg": (msg or "")[:140],
+    }
+    _RECENT_EVICTIONS.append(entry)
+    if len(_RECENT_EVICTIONS) > _RECENT_EVICTIONS_MAX:
+        _RECENT_EVICTIONS.pop(0)
+    print(
+        f"[agentica-mcp-runtime] evict {server} ({error_class}): {entry['msg']}",
+        file=_sys.stderr,
+        flush=True,
+    )
+
+
+def _install_diagnostics(loop: asyncio.AbstractEventLoop) -> None:
+    """One-time install of atexit + loop exception-handler hooks.
+
+    Idempotent across multiple SandboxSession.start() calls (testing
+    re-creates sessions). The atexit hook always fires on Python exit;
+    the loop handler catches uncaught task exceptions that fastmcp's
+    transport layer would otherwise swallow.
+    """
+    global _INSTALLED_DIAGNOSTICS
+    if _INSTALLED_DIAGNOSTICS:
+        return
+    import atexit as _atexit, sys as _sys
+
+    def _on_exit():
+        # Compact summary so this fits on one line in Claude Code's log
+        # viewer. The recent-evictions tail is the load-bearing detail:
+        # if we exited mid-cascade, this tells us so.
+        tail = _RECENT_EVICTIONS[-5:]
+        print(
+            f"[agentica-mcp-runtime] process exiting; recent_evictions={tail}",
+            file=_sys.stderr,
+            flush=True,
+        )
+
+    _atexit.register(_on_exit)
+
+    def _on_loop_exception(_loop, context):
+        exc = context.get("exception")
+        ctx_msg = context.get("message", "(no message)")
+        if exc is not None:
+            print(
+                f"[agentica-mcp-runtime] loop exception: "
+                f"{type(exc).__name__}: {exc} | {ctx_msg}",
+                file=_sys.stderr,
+                flush=True,
+            )
+        else:
+            print(
+                f"[agentica-mcp-runtime] loop alert: {ctx_msg}",
+                file=_sys.stderr,
+                flush=True,
+            )
+        # Fall through to the default handler so anyio / Task warnings
+        # still get their usual stderr dump.
+        _loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_on_loop_exception)
+    _INSTALLED_DIAGNOSTICS = True
+
 
 # Failure classification for retry-decision purposes. Mirrors the
 # `McpInvocationErrorClass` taxonomy from our executor branch
@@ -445,6 +598,11 @@ class SandboxSession:
         loop = asyncio.get_running_loop()
         self._repl.set_loop(loop)
 
+        # Install crash/exit breadcrumbs now that the loop exists. Previous
+        # versions died silently under load — this captures the cascade so
+        # the next failure leaves a visible trail in Claude Code's MCP log.
+        _install_diagnostics(loop)
+
         # Wrap MCPFunctions to handle text content (not just structuredContent).
         # Key by the wrapper's sanitized python name so hyphenated MCP tools
         # (e.g. "codex-reply") are reachable in the REPL as snake_case identifiers.
@@ -590,20 +748,30 @@ def _wrap_mcp_function(fn: MCPFunction) -> Callable:
         args_dict: dict = {py_to_mcp.get(k, k): v for k, v in bound.arguments.items()}
 
         mcp_config = fn._MCPFunction__mcp_config
+        server_name = _server_name_for_config(mcp_config)
         client = await _get_persistent_client(mcp_config)
+        sem = await _get_server_semaphore(server_name)
         _t0 = time.time()
-        # Evict only on `transport` / `auth` classes (see _classify_error).
-        # Tool-level rejections (bad args, schema mismatch) keep the
-        # Client cached — retrying with a fresh Client wouldn't change
-        # the outcome and just doubles the proxy round-trip. Unknown
-        # errors also stay cached for the same reason: cold reconnect
-        # is wasted work on bugs in our own code.
-        try:
-            result = await client.session.call_tool(fn.__name__, args_dict)
-        except Exception as _e:
-            if _classify_error(_e, str(_e)) in ("transport", "auth"):
-                await _evict_persistent_client(mcp_config)
-            raise
+        # The semaphore wraps only the proxy round-trip — local result
+        # parsing happens unbounded. _t0 is OUTSIDE the `async with` so
+        # the slow-tool log captures user-visible latency including
+        # any time we spent queued behind other tasks. Persistent
+        # queue waits are themselves a signal worth surfacing.
+        async with sem:
+            # Evict only on `transport` / `auth` classes (see _classify_error).
+            # Tool-level rejections (bad args, schema mismatch) keep the
+            # Client cached — retrying with a fresh Client wouldn't change
+            # the outcome and just doubles the proxy round-trip. Unknown
+            # errors also stay cached for the same reason: cold reconnect
+            # is wasted work on bugs in our own code.
+            try:
+                result = await client.session.call_tool(fn.__name__, args_dict)
+            except Exception as _e:
+                _cls = _classify_error(_e, str(_e))
+                if _cls in ("transport", "auth"):
+                    _record_eviction(server_name, _cls, f"{type(_e).__name__}: {_e}")
+                    await _evict_persistent_client(mcp_config)
+                raise
         _elapsed = time.time() - _t0
         # Slow-tool capture: ring buffer of calls over the threshold so
         # slow_tool_log() / runtime_status() can surface bogged-down tools.
@@ -618,7 +786,9 @@ def _wrap_mcp_function(fn: MCPFunction) -> Callable:
                 _MCP_SLOW_LOG.pop(0)
         if result.isError:
             msg = ";".join(getattr(tc, "text", repr(tc)) for tc in result.content)
-            if _classify_error(None, msg) in ("transport", "auth"):
+            _cls = _classify_error(None, msg)
+            if _cls in ("transport", "auth"):
+                _record_eviction(server_name, _cls, msg)
                 await _evict_persistent_client(mcp_config)
             hint = _hint_for_mcp_error(msg, fn.__name__)
             raise RuntimeError(f"{msg}\n\nHINT: {hint}" if hint else msg)
