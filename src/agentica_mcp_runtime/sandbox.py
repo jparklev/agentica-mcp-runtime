@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import json
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -583,6 +585,35 @@ def register_pre_open_hook(fn: Callable[[Any], None]) -> None:
     _PRE_OPEN_HOOKS.append(fn)
 
 
+# Execution tracing: per python(code) MCP call, a UUID is stashed in this
+# ContextVar so any helper invoked during execution (artifact_save, etc.)
+# can associate its writes with the invocation that produced them. Default
+# None outside any active execution. Public — user-space helpers read it
+# directly via `agentica_mcp_runtime.sandbox.EXECUTION_ID.get()`.
+EXECUTION_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "agentica_execution_id", default=None
+)
+
+# Hooks fired after each SandboxSession.execute() returns. Each receives
+# (execution_id, code, ExecutionResult). Canonical use: helpers.py registers
+# a hook that writes one row to artifacts.sqlite's `executions` table, so a
+# separate viewer process can render a timeline of code → output → artifacts.
+_EXECUTION_END_HOOKS: list[Callable[[str, str, "ExecutionResult"], None]] = []
+
+
+def register_execution_end_hook(
+    fn: Callable[[str, str, "ExecutionResult"], None],
+) -> None:
+    """Register a callback to run after each python(code) MCP invocation.
+
+    The callback receives `(execution_id, code, result)`. Hooks must NOT
+    raise — failures get logged to stderr and swallowed so a broken hook
+    can't crash the REPL. Use case: user-space observability writing one
+    row per call to a SQLite trace log that a notebook viewer renders.
+    """
+    _EXECUTION_END_HOOKS.append(fn)
+
+
 async def _get_persistent_client(mcp_config) -> Client:
     """Return an open Client for this mcp_config, opening one if needed."""
     global _open_lock
@@ -838,6 +869,12 @@ class SandboxSession:
 
         Code can call MCP tool functions as regular async functions using await.
         Variables persist across executions.
+
+        Each call gets a UUID stashed in the `EXECUTION_ID` ContextVar so any
+        helper invoked during execution (e.g. `artifact_save`) can associate
+        its writes with this invocation. After the call returns (or fails),
+        every callback registered via `register_execution_end_hook` fires with
+        `(execution_id, code, result)`.
         """
         if self._repl is None:
             raise RuntimeError("Sandbox not initialized — no MCP tools were discovered at startup.")
@@ -856,13 +893,19 @@ class SandboxSession:
             )
 
         self._has_executed = True
-        info = await self._repl.async_run_code_info(code)
+
+        execution_id = uuid.uuid4().hex
+        token = EXECUTION_ID.set(execution_id)
+        try:
+            info = await self._repl.async_run_code_info(code)
+        finally:
+            EXECUTION_ID.reset(token)
 
         error_str = None
         if info.has_error:
             error_str = info.traceback_str or info.exception_name or "Unknown error"
 
-        return ExecutionResult(
+        result = ExecutionResult(
             output=lint_warning + info.output,
             result_repr=info.out_str,
             error=error_str,
@@ -871,6 +914,23 @@ class SandboxSession:
             changed_vars=info.changed_locals,
             duration=info.duration,
         )
+
+        # Fire execution_end hooks. Failures are swallowed so a broken hook
+        # can never break the REPL — hooks are observability, not load-bearing.
+        for hook in _EXECUTION_END_HOOKS:
+            try:
+                hook(execution_id, code, result)
+            except Exception as _hook_err:
+                import sys as _sys_local
+                print(
+                    f"[agentica-mcp-runtime] execution_end hook "
+                    f"{getattr(hook, '__name__', repr(hook))} failed: "
+                    f"{type(_hook_err).__name__}: {_hook_err}",
+                    file=_sys_local.stderr,
+                    flush=True,
+                )
+
+        return result
 
     def stop(self) -> None:
         """Tear down the REPL session."""
